@@ -1,46 +1,85 @@
-﻿using HtmlAgilityPack;
+﻿using Catalog.Parser.Models;
+using HtmlAgilityPack;
 
 namespace Catalog.Parser.Parser;
 
 public class Parser
 {
-    public void Parse()
+    private readonly HtmlWeb _web = new();
+    private const int MaxConcurrency = 6;
+    private const string BaseUrl = "https://www.jcrew.com/pl/plp/womens/categories/clothing";
+    private const string ProductTileClassname = "c-product-tile";
+    private const string ProductPriceClassname = "is-price";
+
+    public async Task RunAsync()
     {
-        const string url = "https://www.jcrew.com/pl/plp/womens/categories/clothing?Npge=2";
-        const string productTileClassname = "c-product-tile";
-        const string productPriceClassname = "is-price";
-
-        HtmlWeb web = new ();
-
-        HtmlDocument document = web.Load(url);
-
-        HtmlNodeCollection? productNodes = document.DocumentNode.SelectNodes($"//li[contains(@class, {productTileClassname})]");
+        List<string> urls = Enumerable.Range(1, 10)
+            .Select(i => $"{BaseUrl}?Npge={i}")
+            .ToList();
         
-        if (productNodes == null)
+        SemaphoreSlim semaphore = new (MaxConcurrency);
+        List<Task<HtmlDocument>> tasks = [];
+        
+        foreach (string url in urls)
         {
-            Console.WriteLine("There's no products on the page.");
-            return;
+            tasks.Add(Task.Run(async () =>
+            {
+                await semaphore.WaitAsync();
+                try
+                {
+                    Console.WriteLine($"Loading: {url}");
+                    return await _web.LoadFromWebAsync(url);
+                }
+                finally
+                {
+                    semaphore.Release();
+                }
+            }));
         }
         
-        foreach (HtmlNode product in productNodes)
+        HtmlDocument[] htmlPages = await Task.WhenAll(tasks);
+
+        List<Product> resultProducts = [];
+
+        foreach (HtmlDocument htmlDocument in htmlPages)
         {
-            HtmlNode? hyperlinkNode = product.SelectSingleNode(".//a");
-            string href = hyperlinkNode?.GetAttributeValue("href", "N/A") ?? "N/A";
-            
-            HtmlNode? nameNode = product.SelectSingleNode(".//h2");
-            string name = nameNode?.InnerText.Trim() ?? "N/A";
-            
-            HtmlNode? priceNode = product.SelectSingleNode($".//span[contains(@class, {productPriceClassname})]");
-            string price = ParsePrice(priceNode);
-            
-            Console.WriteLine($"Name: {name}");
-            Console.WriteLine($"HREF: https://www.jcrew.com{href}");
-            Console.WriteLine($"Price: {price}");
-            Console.WriteLine(new string('-', 40));
+            resultProducts.AddRange(ParseHtml(htmlDocument));
         }
+        
+        string directoryPath = Path.Combine(Directory.GetCurrentDirectory(), "parsed");
+        Directory.CreateDirectory(directoryPath);
+        
+        string filePath = Path.Combine(directoryPath, "products.txt");
+        await File.WriteAllLinesAsync(filePath, resultProducts.Select(p => p.ToString()));
+        Console.WriteLine("Saved");
     }
     
-    private string ParsePrice(HtmlNode? node)
+    private List<Product> ParseHtml(HtmlDocument htmlDocument)
+    {
+
+        HtmlNodeCollection? nodes = htmlDocument.DocumentNode.SelectNodes($"//li[contains(@class, {ProductTileClassname})]");
+        if (nodes == null) return [];
+
+        List<Product> products = [];
+        
+        foreach (HtmlNode node in nodes)
+        {
+            string name = node.SelectSingleNode(".//h2")?.InnerText.Trim() ?? "N/A";
+            string href = node.SelectSingleNode(".//a")?.GetAttributeValue("href", "N/A") ?? "N/A";
+            string price = ParsePrice(node.SelectSingleNode($".//span[contains(@class, {ProductPriceClassname})]"));
+
+            products.Add(new Product
+            {
+                Name = name,
+                Href = $"https://www.jcrew.com{href}",
+                Price = price,
+            });
+        }
+
+        return products;
+    }
+    
+   private string ParsePrice(HtmlNode? node)
     {
         if (node is null)
         {
