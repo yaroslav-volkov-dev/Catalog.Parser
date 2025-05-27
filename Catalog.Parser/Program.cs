@@ -2,10 +2,10 @@
 
 class Program 
 {
-    static void Main()
+    static async Task Main()
     {
        Parser parser = new();
      
-       parser.Parse();
+       await parser.RunAsync();
     }
 }
