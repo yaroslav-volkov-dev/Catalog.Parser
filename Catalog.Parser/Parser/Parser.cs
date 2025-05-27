@@ -1,20 +1,19 @@
 ﻿using Catalog.Parser.Models;
 using HtmlAgilityPack;
+using Newtonsoft.Json.Linq;
 
 namespace Catalog.Parser.Parser;
 
 public class Parser
 {
-    private readonly HtmlWeb _web = new();
     private const int MaxConcurrency = 6;
     private const string BaseUrl = "https://www.jcrew.com/pl/plp/womens/categories/clothing";
-    private const string ProductTileClassname = "c-product-tile";
-    private const string ProductPriceClassname = "is-price";
+    private readonly HtmlWeb _web = new();
 
     public async Task RunAsync()
     {
-        List<string> urls = Enumerable.Range(1, 10)
-            .Select(i => $"{BaseUrl}?Npge={i}")
+        List<string> urls = Enumerable.Range(1, 20)
+            .Select(pageNumber => $"{BaseUrl}?Npge={pageNumber}")
             .ToList();
         
         SemaphoreSlim semaphore = new (MaxConcurrency);
@@ -25,71 +24,89 @@ public class Parser
             tasks.Add(Task.Run(async () =>
             {
                 await semaphore.WaitAsync();
+                
                 try
                 {
-                    Console.WriteLine($"Loading: {url}");
+                    Console.WriteLine($"Loading {url}");
                     return await _web.LoadFromWebAsync(url);
+                }
+                catch (Exception exception)
+                {
+                    Console.WriteLine($"Error {url}: {exception.Message}");
+                    return null;
                 }
                 finally
                 {
                     semaphore.Release();
                 }
-            }));
+            })!);
         }
-        
-        HtmlDocument[] htmlPages = await Task.WhenAll(tasks);
-
+         
+        HtmlDocument[] htmlDocuments = await Task.WhenAll(tasks);
         List<Product> resultProducts = [];
 
-        foreach (HtmlDocument htmlDocument in htmlPages)
+        foreach (HtmlDocument document in htmlDocuments)
         {
-            resultProducts.AddRange(ParseHtml(htmlDocument));
+            List<Product> parsed = ParseFromNextDataScript(document);
+            resultProducts.AddRange(parsed);
         }
         
         string directoryPath = Path.Combine(Directory.GetCurrentDirectory(), "parsed");
         Directory.CreateDirectory(directoryPath);
         
-        string filePath = Path.Combine(directoryPath, "products.txt");
-        await File.WriteAllLinesAsync(filePath, resultProducts.Select(p => p.ToString()));
+        string filePath = Path.Combine(directoryPath, "products.csv");
+        List<string> csvLines = ["Name,Href,Price"];
+        csvLines.AddRange(resultProducts.Select(product =>
+            $"\"{product.Name}\",\"{product.Href}\",\"{product.Price}\""
+        ));
+        await File.WriteAllLinesAsync(filePath, csvLines);
         Console.WriteLine("Saved");
     }
     
-    private List<Product> ParseHtml(HtmlDocument htmlDocument)
+    private List<Product> ParseFromNextDataScript(HtmlDocument htmlDocument)
     {
-
-        HtmlNodeCollection? nodes = htmlDocument.DocumentNode.SelectNodes($"//li[contains(@class, {ProductTileClassname})]");
-        if (nodes == null) return [];
-
-        List<Product> products = [];
-        
-        foreach (HtmlNode node in nodes)
+        HtmlNode? scriptNode = htmlDocument.DocumentNode.SelectSingleNode("//script[@id='__NEXT_DATA__']");
+        if (scriptNode == null)
         {
-            string name = node.SelectSingleNode(".//h2")?.InnerText.Trim() ?? "N/A";
-            string href = node.SelectSingleNode(".//a")?.GetAttributeValue("href", "N/A") ?? "N/A";
-            string price = ParsePrice(node.SelectSingleNode($".//span[contains(@class, {ProductPriceClassname})]"));
-
-            products.Add(new Product
-            {
-                Name = name,
-                Href = $"https://www.jcrew.com{href}",
-                Price = price,
-            });
+            Console.WriteLine("Error: __NEXT_DATA__ script tag not found.");
+            return [];
         }
 
-        return products;
-    }
-    
-   private string ParsePrice(HtmlNode? node)
-    {
-        if (node is null)
+        try
         {
-            return "N/A";
-        };
-        IEnumerable<string> visibleTexts = node.ChildNodes
-            .Where(n => !(n.Name == "span" && n.GetClasses().Contains("is-visually-hidden")))
-            .Select(n => n.InnerText.Trim())
-            .Where(text => !string.IsNullOrEmpty(text));
+            string json = scriptNode.InnerText;
+            JObject root = JObject.Parse(json);
 
-        return string.Join(" ", visibleTexts);
+            JToken? productsJsonArray = root.SelectToken("props.initialState.array.data.productArray.productList[0].products");
+
+            if (productsJsonArray is not JArray)
+            {
+                Console.WriteLine("Error: Products array not found in __NEXT_DATA__ JSON.");
+                return [];
+            }
+
+            List<Product> products = [];
+
+            foreach (JToken productJson in productsJsonArray)
+            {
+                string name = productJson["productDescription"]?.ToString() ?? "N/A";
+                string href = productJson["url"]?.ToString() ?? "";
+                string price = productJson["now"]?["formatted"]?.ToString() ?? "N/A";
+
+                products.Add(new Product
+                {
+                    Name = name,
+                    Href = $"https://www.jcrew.com{href}",
+                    Price = price
+                });
+            }
+
+            return products;
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine("Error" + ex.Message);
+            return [];
+        }
     }
 }
